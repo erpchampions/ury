@@ -1,11 +1,17 @@
 let old_items = [];
 let new_items = [];
 let finalarray = [];
+
 frappe.ui.form.on("POS Invoice", {
   refresh: function (frm) {
     cur_frm.check = true;
   },
   after_save: function (frm) {
+    // Only run KOT logic if this is a restaurant POS profile
+    if (!frm.doc.restaurant_table && !is_restaurant_profile(frm)) {
+      return; // Skip KOT for non-restaurant profiles
+    }
+
     let invoice_comment = cur_frm.order_comments;
 
     if (cur_frm.check == true) {
@@ -35,14 +41,23 @@ frappe.ui.form.on("POS Invoice", {
       },
       callback: function (r) {
         cur_frm.order_comments = "";
-
         old_items = new_items;
-
         new_items = [];
         cur_frm.check = false;
-
         frappe.show_alert({ message: __("Order Updated"), indicator: "green" });
       },
     });
   },
 });
+
+// Helper function to check if POS profile is restaurant-linked
+function is_restaurant_profile(frm) {
+  // Check if POS Profile has restaurant field populated
+  return frappe.db.get_value(
+    'POS Profile',
+    frm.doc.pos_profile,
+    'restaurant'
+  ).then(r => {
+    return r && r.message && r.message.restaurant;
+  });
+}

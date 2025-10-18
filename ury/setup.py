@@ -305,7 +305,7 @@ def get_custom_fields():
 				"insert_after": "restaurant_info",
 				"label": "Restaurant",
 				"options": "URY Restaurant",
-				"reqd": 1
+				"reqd": 0
 			},
 			{
 				"fieldname": "column_break_e3dky",
@@ -318,7 +318,7 @@ def get_custom_fields():
 				"insert_after": "column_break_e3dky",
 				"label": "Branch",
 				"options": "Branch",
-				"reqd": 1
+				"reqd": 0
 			}
 		],
 
