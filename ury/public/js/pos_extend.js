@@ -73,14 +73,28 @@ frappe.pages["point-of-sale"].on_page_load = function (wrapper) {
         super(wrapper);
       }
       prepare_menu() {
-        // Don't clear menu - preserve standard ERPNext menu items
-        // this.page.clear_menu();
+        this.page.clear_menu();
+
+        this.page.add_menu_item(
+          __("Toggle Recent Orders"),
+          this.toggle_recent_order.bind(this),
+          false,
+          "Ctrl+O"
+        );
+
 
         this.page.add_menu_item(
           __("Cancel Order"),
           this.cancel_order.bind(this),
           false,
           "Ctrl+I"
+        );
+          // Close POS menu item (standard ERPNext functionality)
+        this.page.add_menu_item(
+          __("Close the POS"),
+          this.close_pos.bind(this),
+          false,
+          "Shift+Ctrl+C"
         );
       }
       cancel_order() {
