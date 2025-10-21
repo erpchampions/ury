@@ -30,7 +30,7 @@ frappe.pages["point-of-sale"].on_page_load = function (wrapper) {
           df: {
             label: ('Invoice Status'),
             fieldtype: 'Select',
-            options: `Draft\nTo Bill`,
+            options: `Draft\nTo Bill\nPaid\nConsolidated\nReturn`,
             placeholder: ('Filter by invoice status'),
             onchange: function () {
               if (me.$component.is(":visible")) me.refresh_list();
@@ -57,7 +57,19 @@ frappe.pages["point-of-sale"].on_page_load = function (wrapper) {
           args: { search_term, status },
           callback: (response) => {
             frappe.dom.unfreeze();
-            response.message.forEach((invoice) => {
+            
+            const invoices = response && response.message ? response.message : [];
+            
+            if (invoices.length === 0) {
+              this.$invoices_container.html(`
+                <div style="padding: 20px; text-align: center; color: #888;">
+                  No ${status} invoices found
+                </div>
+              `);
+              return;
+            }
+            
+            invoices.forEach((invoice) => {
               const invoice_html = this.get_invoice_html(invoice);
               this.$invoices_container.append(invoice_html);
             });
