@@ -44,7 +44,7 @@ frappe.ui.form.on("POS Invoice", {
         old_items = new_items;
         new_items = [];
         cur_frm.check = false;
-        frappe.show_alert({ message: __("Order Updated"), indicator: "green" });
+        //frappe.show_alert({ message: __("Order Updated"), indicator: "green" });
       },
     });
   },
