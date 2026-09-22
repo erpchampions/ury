@@ -7,7 +7,7 @@ from erpnext.accounts.doctype.pos_invoice.pos_invoice import (
 )
 from erpnext.manufacturing.doctype.bom.bom import get_bom_items_as_dict
 from erpnext.manufacturing.doctype.work_order.work_order import make_stock_entry
-from erpnext.stock.stock_ledger import NegativeStockError, is_negative_stock_allowed
+from erpnext.stock.stock_ledger import is_negative_stock_allowed
 from erpnext.stock.utils import get_stock_balance
 from frappe import _
 from frappe.model.meta import get_field_precision
@@ -51,7 +51,6 @@ class URYPOSInvoice(POSInvoice):
 
         # Fetch QSR item groups for this POS Profile
         auto_manufacture_on_sale = self.get_auto_manufacture_setting()
-        print(f"Auto Manufacture on Sale: {auto_manufacture_on_sale}")
         qsr_item_groups = self.get_qsr_item_groups(self.pos_profile)
 
         missing_materials = []
@@ -75,12 +74,12 @@ class URYPOSInvoice(POSInvoice):
 
             self.raise_if_missing_materials(missing_materials)
 
-            if (
-                self.docstatus.is_draft()
-                and qsr_item_groups
-                and not self.skip_raw_material_validation
-            ):
-                self.skip_raw_material_validation = 1
+        if (
+            self.docstatus.is_draft()
+            and qsr_item_groups
+            and not self.skip_raw_material_validation
+        ):
+            self.skip_raw_material_validation = 1
 
     def get_auto_manufacture_setting(self):
         """Fetch Auto Manufacture on Sale flag from POS Profile"""
@@ -92,12 +91,12 @@ class URYPOSInvoice(POSInvoice):
         """Validate that required raw materials for a QSR item are available."""
         if self.docstatus.is_draft() and not self.skip_raw_material_validation:
             bom = frappe.db.get_value(
-                "BOM", {"item": d.item_code, "is_default": 1}, "name"
+                "BOM", {"item": d.item_code, "is_default": 1, "is_active": 1}, "name"
             )
             if not bom:
                 frappe.throw(
                     _("Row #{0}: No default BOM found for QSR Item {1}").format(
-                        d.idx, d.item_code
+                        d.idx, d.item_name
                     )
                 )
 
@@ -141,12 +140,12 @@ class URYPOSInvoice(POSInvoice):
 
     def validate_normal_item_stock(self, d):
         """Validate normal stock items not part of QSR groups."""
-        if is_negative_stock_allowed(item_code=d.item_code):
-            return
-
-        available_stock, is_stock_item = get_stock_availability(
+        available_stock, is_stock_item, is_negative_stock_allowed = get_stock_availability(
             d.item_code, d.warehouse
         )
+
+        if is_negative_stock_allowed:
+            return
 
         if is_stock_item and flt(available_stock) <= 0:
             frappe.throw(
@@ -184,11 +183,12 @@ class URYPOSInvoice(POSInvoice):
     def get_all_leaf_bom_items(bom, company, qsr_item_groups):
         """
         Recursively expand a BOM into its ultimate raw materials ("leaf items").
+        Respecting the "Do Not Explode" flag.
 
         - If a BOM item belongs to a QSR (make-to-order) group:
-                - Try to resolve its default BOM.
-                - If found, recurse deeper until only non-QSR or QSR items with no BOM remain.
-                - If no BOM exists, throw an error for misconfigured BOM.
+                - If it has "Do Not Explode" checked, treat as a leaf item.
+                - Else, it it has a default BOM, recurse deeper,
+                - If no default BOM exists, throw an error for misconfigured BOM.
         - If a BOM item is not in a QSR group:
                 - Treat it directly as a leaf raw material.
 
@@ -207,9 +207,16 @@ class URYPOSInvoice(POSInvoice):
         for rm_code, rm in bom_items.items():
             rm_item_group = frappe.db.get_value("Item", rm_code, "item_group")
 
-            if rm_item_group in qsr_item_groups:
+            do_not_explode = (
+                frappe.db.get_value(
+                    "BOM Item", {"parent": bom, "item_code": rm_code}, "do_not_explode"
+                )
+                or 0
+            )
+
+            if rm_item_group in qsr_item_groups and not do_not_explode:
                 child_bom = frappe.db.get_value(
-                    "BOM", {"item": rm_code, "is_default": 1}, "name"
+                    "BOM", {"item": rm_code, "is_default": 1, "is_active": 1}, "name"
                 )
                 if child_bom:
                     child_items = URYPOSInvoice.get_all_leaf_bom_items(
@@ -238,6 +245,7 @@ class URYPOSInvoice(POSInvoice):
                         )
                     )
             else:
+                # Either non-QSR or "Do Not Explode" = 1
                 items[rm_code] = items.get(
                     rm_code, {"qty": 0, "item_name": rm["item_name"]}
                 )
@@ -464,13 +472,18 @@ class URYPOSInvoice(POSInvoice):
         """
         Run before POS Invoice is submitted.
         - Ensures all linked Work Orders are submitted and completed.
-        - Creates Manufacture stock entries.
-        - Marks all related URY KOTs as Served (inline KOT update).
+        - For each WO:
+            - If SE exists (draft) → submit it.
+            - If SE exists (submitted) → skip.
+            - Else → create and submit a new one.
+        - Marks all related URY KOTs as Served.
+        - Collects results and throws a single clear error summary if any failed.
         """
 
-        auto_manufacture_on_sale = self.get_auto_manufacture_setting()
-        if not auto_manufacture_on_sale:
+        if not self.get_auto_manufacture_setting():
             return
+
+        failed, skipped, succeeded = [], [], []
 
         work_orders = frappe.get_all(
             "Work Order",
@@ -488,43 +501,95 @@ class URYPOSInvoice(POSInvoice):
             pending_qty = (work_order.qty or 0) - (work_order.produced_qty or 0)
 
             if pending_qty <= 0 or work_order.status == "Completed":
+                skipped.append(f"{wo.name} (already completed or no pending qty)")
                 continue
 
-            # 2. Manufacture Stock Entry
             try:
-                stock_entry_data = make_stock_entry(
-                    work_order.name, "Manufacture", qty=pending_qty
-                )
-                stock_entry_doc = frappe.get_doc(
-                    stock_entry_data
-                )  # Convert dict to Doc
+                frappe.db.savepoint("before_auto_manufacture")
 
-                # Align stock entry posting date/time with invoice
-                invoice_dt = get_datetime(f"{self.posting_date} {self.posting_time}")
-                if invoice_dt.time().strftime("%H:%M:%S") == "00:00:00":
-                    adjusted_dt = invoice_dt
+                existing_entries = frappe.get_all(
+                    "Stock Entry",
+                    filters={"work_order": work_order.name},
+                    fields=["name", "docstatus"],
+                    order_by="creation desc",
+                    limit_page_length=1,
+                )
+
+                se_doc = None
+
+                # Prefer a draft SE if it exists
+                draft_entry = next(
+                    (se for se in existing_entries if se.docstatus == 0), None
+                )
+                if draft_entry:
+                    se_doc = frappe.get_doc("Stock Entry", draft_entry.name)
+                    se_doc.submit()
+                    succeeded.append(
+                        f"{work_order.name} (used existing draft SE {se_doc.name})"
+                    )
+
+                # Otherwise, skip if already submitted
+                elif existing_entries and existing_entries[0].docstatus == 1:
+                    skipped.append(
+                        f"{work_order.name} (SE {existing_entries[0].name} already submitted)"
+                    )
+
                 else:
-                    adjusted_dt = invoice_dt - timedelta(seconds=1)
+                    # 2. Manufacture Stock Entry
+                    stock_entry_data = make_stock_entry(
+                        work_order.name, "Manufacture", qty=pending_qty
+                    )
 
-                invoice_dt = invoice_dt + timedelta(seconds=3)
-                self.posting_time = invoice_dt.time().strftime("%H:%M:%S")
+                    if not stock_entry_data:
+                        failed.append(
+                            (work_order.name, "make_stock_entry returned None")
+                        )
+                        frappe.db.rollback(save_point="before_auto_manufacture")
+                        continue
 
-                stock_entry_doc.posting_date = adjusted_dt.date()
-                stock_entry_doc.posting_time = adjusted_dt.strftime("%H:%M:%S")
+                    stock_entry_doc = frappe.get_doc(
+                        stock_entry_data
+                    )  # Convert dict to Doc
 
-                stock_entry_doc.insert()
-                stock_entry_doc.submit()
-            except NegativeStockError as e:
-                frappe.throw(
-                    f"Cannot auto-complete Work Order {work_order.name}: insufficient stock.\n{e}"
-                )
+                    # Align stock entry posting date/time with invoice
+                    invoice_dt = get_datetime(
+                        f"{self.posting_date} {self.posting_time}"
+                    )
+                    if invoice_dt.time().strftime("%H:%M:%S") == "00:00:00":
+                        adjusted_dt = invoice_dt
+                    else:
+                        adjusted_dt = invoice_dt - timedelta(seconds=1)
 
-            if work_order.status != "Completed":
-                frappe.db.set_value(
-                    "Work Order", work_order.name, "status", "Completed"
-                )
-                frappe.db.set_value(
-                    "Work Order", work_order.name, "actual_end_date", now()
+                    invoice_dt = invoice_dt + timedelta(seconds=3)
+                    self.posting_time = invoice_dt.time().strftime("%H:%M:%S")
+
+                    stock_entry_doc.posting_date = adjusted_dt.date()
+                    stock_entry_doc.posting_time = adjusted_dt.strftime("%H:%M:%S")
+
+                    stock_entry_doc.flags.ignore_permissions = True
+                    stock_entry_doc.insert()
+                    stock_entry_doc.submit()
+                    succeeded.append(
+                        f"{work_order.name} (created new SE {stock_entry_doc.name})"
+                    )
+
+                if work_order.status != "Completed":
+                    frappe.db.set_value(
+                        "Work Order", work_order.name, "status", "Completed"
+                    )
+                    frappe.db.set_value(
+                        "Work Order", work_order.name, "actual_end_date", now()
+                    )
+
+            except frappe.ValidationError as e:
+                frappe.db.rollback(save_point="before_auto_manufacture")
+                frappe.clear_messages()
+                failed.append(f"{work_order.name}: insufficient stock → {e}")
+
+            except Exception:
+                frappe.db.rollback(save_point="before_auto_manufacture")
+                failed.append(
+                    f"{work_order.name}: unexpected error → {frappe.get_traceback()}"
                 )
 
         def _mark_kot_served(kot_name):
@@ -551,3 +616,10 @@ class URYPOSInvoice(POSInvoice):
             _mark_kot_served(kot["name"])
 
         frappe.db.commit()
+
+        if failed:
+            frappe.clear_messages()
+            frappe.throw(
+                "Some Work Orders could not be completed:\n\n" + "\n".join(failed),
+                title="Auto Manufacture Errors",
+            )
